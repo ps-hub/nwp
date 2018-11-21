@@ -13,17 +13,17 @@ import subprocess
 from osgeo import gdal, ogr
 import numpy as np
 import requests
+import schedule
 
-# extent + через warp
-# del все grib кроме архивов
-# time 04 local 07 (6:50)
 
 class ICON:
     def __init__(self, root_dir, cdo_target, cdo_weight):
-        #self.VAR = ['tot_prec']
+        # self.VAR = ['t_2m']
+        # self.FFF = ['003']
         self.VAR = ['t_2m', 'td_2m', 'tot_prec', 'u_10m', 'v_10m']
         self.FFF = ['003', '006', '009', '012', '015', '018', '021', '024', '027']
-        #self.FFF = ['003']
+        self.EXTENT = {'leftlon': 35, 'rightlon': 65, 
+                       'toplat': 65, 'bottomlat': 50}
         
         self.cdo_target = cdo_target
         self.cdo_weight = cdo_weight
@@ -84,48 +84,67 @@ class ICON:
             cmd = f'cdo -f grb2 remap,{self.cdo_target},{self.cdo_weight} {inp_file} {out_file}'
             subprocess.call(cmd, shell=True)
             logging.info(f'CDO Remap - {dtime}/{out_name}')
+            os.remove(inp_file)
 
     def translate(self, dtime):
 
-        def calc_prec(inp_file, out_file):
-            raster = gdal.Open(inp_file)
-            array = raster.ReadAsArray().astype(np.float32)
-            
-            row, col = array.shape
-            band = 1
-            dtype = gdal.GDT_Float32
-            driver = gdal.GetDriverByName("GTiff")
-            out_raster = driver.Create(out_file, col, row, band, dtype)
-            
-            proj = 'GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563,AUTHORITY["EPSG","7030"]],AUTHORITY["EPSG","6326"]],PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433],AUTHORITY["EPSG","4326"]]'
-            transform = raster.GetGeoTransform()
-            out_raster.SetProjection(proj)
-            out_raster.SetGeoTransform(transform)
+        def calc_wind(fff, out_dir):
+            inp_name_u = f'icon.{dtime}.{fff}.u_10m.tif'
+            inp_name_v = f'icon.{dtime}.{fff}.v_10m.tif'
+            inp_file_u = os.path.join(out_dir, inp_name_u)
+            inp_file_v = os.path.join(out_dir, inp_name_v)
 
-            hour = int(inp_file.split('.')[2]) # TODO replace re '000'
-            out_array = (array * 3600 * hour)
-            out_raster.GetRasterBand(1).WriteArray(out_array)
+            if os.path.exists(inp_file_u) and os.path.exists(inp_file_v):
+                raster_u = gdal.Open(inp_file_u)
+                raster_v = gdal.Open(inp_file_v)
+                array_u = raster_u.ReadAsArray().astype(np.float32)
+                array_v = raster_v.ReadAsArray().astype(np.float32)
 
-        def calc_wind():
-            pass
+                out_name = f'icon.{dtime}.{fff}.ws_10m.tif'
+                out_file = os.path.join(out_dir, out_name)
+                row, col = array_u.shape
+                band = 1
+                dtype = gdal.GDT_Float32
+                driver = gdal.GetDriverByName("GTiff")
+                out_raster = driver.Create(out_file, col, row, band, dtype)
+
+                proj = 'GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563,AUTHORITY["EPSG","7030"]],AUTHORITY["EPSG","6326"]],PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433],AUTHORITY["EPSG","4326"]]'
+                transform = raster_u.GetGeoTransform()
+                out_raster.SetProjection(proj)
+                out_raster.SetGeoTransform(transform)
+
+                out_array = (array_u**2 + array_v**2)**0.5
+                out_raster.GetRasterBand(1).WriteArray(out_array)
+                
+                logging.info(f'Translate - {dtime}/{out_name}')
+                os.remove(inp_file_u)
+                os.remove(inp_file_v)
         
         inp_dir = os.path.join(self.grib_dir, dtime)
         if os.path.exists(inp_dir):
             out_dir = os.path.join(self.tif_dir, dtime)
             if not os.path.exists(out_dir):
                 os.mkdir(out_dir)
-            for inp_file in glob.glob(f'{inp_dir}//*icon_reg*.grib2'):
-                var = inp_file.split('.')[-2]
-                out_name = os.path.basename(inp_file).replace('icon_reg', 'icon').replace('.grib2', '.tif')
-                out_file = os.path.join(out_dir, out_name)
+            for fff in self.FFF:
+                for var in self.VAR:
+                    inp_name = f'icon_reg.{dtime}.{fff}.{var}.grib2'
+                    inp_file = os.path.join(inp_dir, inp_name)
+                    out_name = f'icon.{dtime}.{fff}.{var}.tif'
+                    out_file = os.path.join(out_dir, out_name)
 
-                if var == 'tot_prec':
-                    calc_prec(inp_file, out_file)
-                else:
-                    #cmd = f'gdal_translate -a_srs EPSG:4326 -ot Float32 {inp_file} {out_file}'
-                    #subprocess.call(cmd, shell=True)
-                    gdal.Translate(out_file, inp_file, outputType=gdal.GDT_Float32, outputSRS='EPSG:4326')
-                logging.info(f'Translate - {dtime}/{out_name}')
+                    projWin = [self.EXTENT['leftlon'],   # ulx
+                               self.EXTENT['toplat'],    # uly
+                               self.EXTENT['rightlon'],  # lrx
+                               self.EXTENT['bottomlat']] # lry
+                    gdal.Translate(out_file,
+                                inp_file,
+                                outputType=gdal.GDT_Float32,
+                                outputSRS='EPSG:4326',
+                                projWin=projWin)
+                    logging.info(f'Translate - {dtime}/{out_name}')
+                    os.remove(inp_file)
+                
+                calc_wind(fff, out_dir) # дополнительно расчет скорости ветра
         else:
             logging.error(f'Translate - Not Found Input Directory - {inp_dir}')
 
@@ -135,8 +154,20 @@ class ICON:
         self.cdo_remap(dtime)
         self.translate(dtime) 
 
-    def daemon(self, dtime):
-        pass
+    def daemon(self):
+        logging.info(f'Daemon - Start')
+
+        def activate(delta):
+            dtime = (datetime.now() - timedelta(hours=delta)).strftime("%Y%m%d%H")
+            self.process(dtime)
+
+        # local time
+        schedule.every().day.at('06:55').do(activate, 6) # cycle 00
+
+        while True:
+            schedule.run_pending()
+            time.sleep(1)
+
 
 if __name__ == '__main__':
     root_dir = r'/cygdrive/c/Users/user/Desktop/icon/data'
@@ -145,7 +176,7 @@ if __name__ == '__main__':
     dtime = '2018112000'
     
     icon = ICON(root_dir, cdo_target, cdo_weight)
-    icon.download(dtime)
+    #icon.download(dtime)
     #icon.unpack(dtime)
     #icon.cdo_remap(dtime)
     #icon.translate(dtime)
